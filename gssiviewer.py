@@ -12,14 +12,15 @@ from __future__ import annotations
 import os
 import struct
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 import numpy as np
 
 try:
-	from PyQt6.QtCore import Qt
-	from PyQt6.QtGui import QAction, QImage, QPixmap
-	from PyQt6.QtWidgets import (
+	from PyQt6.QtCore import Qt  # type: ignore[import-not-found]
+	from PyQt6.QtGui import QAction, QColor, QImage, QPalette, QPixmap  # type: ignore[import-not-found]
+	from PyQt6.QtWidgets import (  # type: ignore[import-not-found]
 		QApplication,
 		QFileDialog,
 		QGridLayout,
@@ -37,7 +38,7 @@ try:
 	PYQT6 = True
 except ImportError:
 	from PyQt5.QtCore import Qt
-	from PyQt5.QtGui import QImage, QPixmap
+	from PyQt5.QtGui import QColor, QImage, QPalette, QPixmap
 	from PyQt5.QtWidgets import (
 		QAction,
 		QApplication,
@@ -263,6 +264,65 @@ def _ascan_to_qpixmap(arr1d: np.ndarray, width: int = 256, height: int = 512) ->
 	return _array_to_qpixmap(canvas)
 
 
+def _apply_designer_palette(app: QApplication, ui_path: str) -> None:
+	"""Apply MainWindow palette from a Qt Designer .ui file, if available."""
+	if not os.path.exists(ui_path):
+		return
+
+	try:
+		root = ET.parse(ui_path).getroot()
+	except ET.ParseError:
+		return
+
+	palette_elem = root.find(".//widget[@name='MainWindow']/property[@name='palette']/palette")
+	if palette_elem is None:
+		return
+
+	base_palette = app.palette()
+
+	if PYQT6:
+		group_map = {
+			"active": QPalette.ColorGroup.Active,
+			"inactive": QPalette.ColorGroup.Inactive,
+			"disabled": QPalette.ColorGroup.Disabled,
+		}
+	else:
+		group_map = {
+			"active": QPalette.Active,
+			"inactive": QPalette.Inactive,
+			"disabled": QPalette.Disabled,
+		}
+
+	for group_name, group_enum in group_map.items():
+		group_elem = palette_elem.find(group_name)
+		if group_elem is None:
+			continue
+
+		for colorrole in group_elem.findall("colorrole"):
+			role_name = colorrole.get("role", "")
+			color_elem = colorrole.find("./brush/color")
+			if color_elem is None:
+				continue
+
+			role_enum = getattr(QPalette, role_name, None)
+			if role_enum is None and PYQT6:
+				role_enum = getattr(QPalette.ColorRole, role_name, None)
+			if role_enum is None:
+				continue
+
+			try:
+				r = int(color_elem.findtext("red", default="0"))
+				g = int(color_elem.findtext("green", default="0"))
+				b = int(color_elem.findtext("blue", default="0"))
+				a = int(color_elem.get("alpha", "255"))
+			except ValueError:
+				continue
+
+			base_palette.setColor(group_enum, role_enum, QColor(r, g, b, a))
+
+	app.setPalette(base_palette)
+
+
 class SlicePanel(QGroupBox):
 	def __init__(self, title: str) -> None:
 		super().__init__(title)
@@ -387,6 +447,7 @@ class MainWindow(QMainWindow):
 		self.yz_panel.image_label.mousePressEvent = self._on_yz_click  # type: ignore[assignment]
 		self.xz_panel.image_label.mousePressEvent = self._on_xz_click  # type: ignore[assignment]
 		self.xy_panel.scroll_area.horizontalScrollBar().valueChanged.connect(self._on_xy_scroll_changed)
+		self.yz_panel.scroll_area.horizontalScrollBar().valueChanged.connect(self._on_yz_scroll_changed)
 
 
 		self._build_ui()
@@ -413,11 +474,11 @@ class MainWindow(QMainWindow):
 		grid.addWidget(self.ascan_panel, 1, 2)
 		main_layout.addLayout(grid, stretch=1)
 
-		slider_layout = QVBoxLayout()
+		# slider_layout = QVBoxLayout()
 
-		slider_layout.addLayout(self._slider_row("Y slice (scan/trace)", self.y_slider))
-
-		main_layout.addLayout(slider_layout)
+		# slider_layout.addLayout(slider_layout, self.y_slider)
+		# main_layout.addLayout(slider_layout)
+		
 
 	def _slider_row(self, title: str, slider: QSlider) -> QHBoxLayout:
 		row = QHBoxLayout()
@@ -485,9 +546,11 @@ class MainWindow(QMainWindow):
 		z_dim, y_dim, x_dim = self.volume.shape
 		self.y_slider.setRange(0, max(0, y_dim - 1))
 
-		# XY keeps scan width while fitting channels to the XY view height.
-		self.xy_panel.set_view_size(y_dim, 504)
-		self.yz_panel.set_view_size(y_dim, 504)
+		# XY keeps scan width while matching channel height to the visible XY view.
+		# xy_h = max(1, self.xy_panel.scroll_area.viewport().height()-20)
+		self.xy_panel.set_view_size(y_dim, 320)
+		# yz_h = max(1, self.yz_panel.scroll_area.viewport().height()-20)
+		self.yz_panel.set_view_size(y_dim, 484)
 
 
 		self.x_idx = x_dim // 2
@@ -507,6 +570,16 @@ class MainWindow(QMainWindow):
 			10000,
 		)
 
+	def resizeEvent(self, event):  # type: ignore[override]
+		super().resizeEvent(event)
+		if self.volume is None:
+			return
+		_, y_dim, _ = self.volume.shape
+		xy_h = max(1, self.xy_panel.scroll_area.viewport().height())
+		if self.xy_panel.image_label.height() != xy_h:
+			self.xy_panel.set_view_size(y_dim, xy_h)
+			self._render_views()
+
 	def _on_slider_change(self) -> None:
 		if self.volume is None:
 			return
@@ -520,6 +593,12 @@ class MainWindow(QMainWindow):
 		target = int(np.clip(value, yz_bar.minimum(), yz_bar.maximum()))
 		if yz_bar.value() != target:
 			yz_bar.setValue(target)
+
+	def _on_yz_scroll_changed(self, value: int) -> None:
+		xy_bar = self.xy_panel.scroll_area.horizontalScrollBar()
+		target = int(np.clip(value, xy_bar.minimum(), xy_bar.maximum()))
+		if xy_bar.value() != target:
+			xy_bar.setValue(target)
 
 	def _on_xy_click(self, event) -> None:  # type: ignore[override]
 		if self.volume is None:
@@ -674,6 +753,7 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
 	app = QApplication(sys.argv)
+	_apply_designer_palette(app, os.path.join(os.path.dirname(__file__), "gssiviewer.ui"))
 	
 	# Get DZT file from command line if provided
 	auto_load = None
